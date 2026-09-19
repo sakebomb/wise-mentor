@@ -15,6 +15,8 @@ import httpx
 from openai import AsyncOpenAI
 import yaml
 
+from memory import MemoryStore, extract_facts, format_memory_block
+
 load_dotenv()
 
 logging.basicConfig(
@@ -46,6 +48,7 @@ def get_config(filename: str = "config.yaml") -> dict[str, Any]:
 
 config = get_config()
 curr_model = next(iter(config["models"]))
+_memory = MemoryStore()
 
 msg_nodes = {}
 last_task_time = 0
@@ -247,10 +250,21 @@ async def on_message(new_msg: discord.Message) -> None:
 
     logging.info(f"Message received (user ID: {new_msg.author.id}, attachments: {len(new_msg.attachments)}, conversation length: {len(messages)}):\n{new_msg.content}")
 
+    memory_block = ""
+    try:
+        user_text = new_msg.content.removeprefix(discord_bot.user.mention).lstrip()
+        for fact in extract_facts(user_text):
+            _memory.remember(new_msg.author.id, fact)
+        memory_block = format_memory_block(_memory.recall(new_msg.author.id))
+    except Exception:
+        logging.exception("Error updating user memory")
+
     if system_prompt := config.get("system_prompt"):
         now = datetime.now().astimezone()
 
         system_prompt = system_prompt.replace("{date}", now.strftime("%B %d %Y")).replace("{time}", now.strftime("%H:%M:%S %Z%z")).strip()
+        if memory_block:
+            system_prompt = f"{system_prompt}\n\n{memory_block}"
 
         messages.append(dict(role="system", content=system_prompt))
 
