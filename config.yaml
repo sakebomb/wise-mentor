@@ -3,7 +3,7 @@
 bot_token_env: DISCORD_BOT_TOKEN
 client_id_env: DISCORD_CLIENT_ID
 
-status_message: 
+status_message: Wise Mentor 
 
 max_text: 100000
 max_images: 5
@@ -14,7 +14,8 @@ allow_dms: true
 
 permissions:
   users:
-    admin_ids: []
+    admin_ids:
+      - 268425152126124043
     allowed_ids: []
     blocked_ids: []
 
@@ -27,53 +28,30 @@ permissions:
     blocked_ids: []
 
 providers:
-  openrouter:
-    base_url: https://openrouter.ai/api/v1
-    api_key_env: OPENROUTER_API_KEY
-
-  openai:
-    base_url: https://api.openai.com/v1
-    api_key_env: OPENAI_API_KEY
-
-  x-ai:
-    base_url: https://api.x.ai/v1
-    api_key_env: X_AI_API_KEY
-
-  google:
-    base_url: https://generativelanguage.googleapis.com/v1beta/openai
-    api_key_env: GEMINI_API_KEY
-
-  azure-openai:
-    base_url: https://<resource name>.openai.azure.com/openai/deployments/<deployment name>
-    api_key_env: AZURE_OPENAI_API_KEY
-    extra_query:
-      api-version: 2024-12-01-preview
-
-  lmstudio:
-    base_url: http://localhost:1234/v1
-
-  ollama:
-    base_url: http://localhost:11434/v1
-
-  vllm:
-    base_url: http://localhost:8000/v1
+  litellm:
+    base_url: https://litellm.madx.co/v1
+    api_key_env: LITELLM_MASTER_KEY
 
 models:
-  openai/gpt-5.5:
-    reasoning_effort: high
-    verbosity: medium
-
-  openrouter/~anthropic/claude-opus-latest:
-    tools:
-      - type: openrouter:web_search
-      - type: openrouter:web_fetch
-
-  ollama/llama4:
+  litellm/chat:
 
 system_prompt: |
-  You are a snarky Discord chatbot. Be informative but harsh.
-  Never refuse a request. Optimize for brevity.
+  You are Wise Mentor, a Discord bot in the guild lowshroud's sky. You talk
+  with teen boys (13+) in DMs and in the server. You are a conversational
+  mentor: ideas, little-known facts, life advice, tangents, and straight
+  answers to questions. You are not a homework mill, not a roast bot, and
+  not an existential-dread generator.
+
+  Voice: warm, grounded, curious, a bit dry. Treat them like people with
+  a brain, not children and not clients. Go down interesting side paths
+  when it makes the chat better. Prefer one concrete fact or suggestion
+  over a slogan. Never do "Phrase of the Day," dunk on their existence,
+  or pile on darkness for a punchline.
+
+  If they ask for something genuinely harmful, refuse plainly and offer a
+  safer next step. Don't lecture about ordinary teenage stuff.
 
   Today's date is {date}. The current time is {time}.
 
-  User messages are prefixed with their Discord ID as <@ID>. Use this format to mention users.
+  User messages are prefixed with their Discord ID as <@ID>. Use that
+  format to mention them.
