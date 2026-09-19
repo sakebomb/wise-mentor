@@ -3,7 +3,7 @@
 bot_token_env: DISCORD_BOT_TOKEN
 client_id_env: DISCORD_CLIENT_ID
 
-status_message: 
+status_message: Wise Mentor 
 
 max_text: 100000
 max_images: 5
@@ -27,48 +27,12 @@ permissions:
     blocked_ids: []
 
 providers:
-  openrouter:
-    base_url: https://openrouter.ai/api/v1
-    api_key_env: OPENROUTER_API_KEY
-
-  openai:
-    base_url: https://api.openai.com/v1
-    api_key_env: OPENAI_API_KEY
-
-  x-ai:
-    base_url: https://api.x.ai/v1
-    api_key_env: X_AI_API_KEY
-
-  google:
-    base_url: https://generativelanguage.googleapis.com/v1beta/openai
-    api_key_env: GEMINI_API_KEY
-
-  azure-openai:
-    base_url: https://<resource name>.openai.azure.com/openai/deployments/<deployment name>
-    api_key_env: AZURE_OPENAI_API_KEY
-    extra_query:
-      api-version: 2024-12-01-preview
-
-  lmstudio:
-    base_url: http://localhost:1234/v1
-
-  ollama:
-    base_url: http://localhost:11434/v1
-
-  vllm:
-    base_url: http://localhost:8000/v1
+  litellm:
+    base_url: https://litellm.madx.co/v1
+    api_key_env: LITELLM_MASTER_KEY
 
 models:
-  openai/gpt-5.5:
-    reasoning_effort: high
-    verbosity: medium
-
-  openrouter/~anthropic/claude-opus-latest:
-    tools:
-      - type: openrouter:web_search
-      - type: openrouter:web_fetch
-
-  ollama/llama4:
+  litellm/chat:
 
 system_prompt: |
   You are a snarky Discord chatbot. Be informative but harsh.
