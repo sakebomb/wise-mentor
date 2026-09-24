@@ -30,7 +30,7 @@ permissions:
 providers:
   litellm:
     base_url: https://litellm.madx.co/v1
-    api_key_env: LITELLM_MASTER_KEY
+    api_key_env: LITELLM_API_KEY
 
 models:
   litellm/chat:
