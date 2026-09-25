@@ -8,6 +8,6 @@ COPY requirements.txt ./
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY llmcord.py config.yaml ./
+COPY llmcord.py memory.py speech.py config.yaml ./
 
 CMD ["python", "llmcord.py"]

@@ -16,6 +16,21 @@ from openai import AsyncOpenAI
 import yaml
 
 from memory import MemoryStore, extract_facts, format_memory_block
+from speech import (
+    DEFAULT_MAX_BYTES,
+    DEFAULT_MAX_CLIPS,
+    PendingClip,
+    VoiceNoteResult,
+    format_heard_prefix,
+    from_config as speech_from_config,
+    heard_field,
+    is_audio_attachment,
+    merge_message_text,
+    resolve_voice_note,
+    should_answer_with_model,
+    should_retry_voice,
+    strip_heard_prefix,
+)
 
 load_dotenv()
 
@@ -61,6 +76,31 @@ discord_bot = commands.Bot(intents=intents, activity=activity, command_prefix=No
 httpx_client = httpx.AsyncClient()
 
 
+def _attachment_bytes(attachment: discord.Attachment):
+    async def fetch() -> bytes:
+        response = await httpx_client.get(attachment.url, timeout=60)
+        response.raise_for_status()
+        return response.content
+
+    return fetch
+
+
+def _audio_clips(message: discord.Message) -> list[PendingClip]:
+    clips = []
+    for attachment in message.attachments:
+        if not is_audio_attachment(attachment.content_type, attachment.filename):
+            continue
+        clips.append(
+            PendingClip(
+                filename=attachment.filename or "voice.ogg",
+                content_type=attachment.content_type,
+                size=attachment.size,
+                fetch=_attachment_bytes(attachment),
+            )
+        )
+    return clips
+
+
 @dataclass
 class MsgNode:
     role: Literal["user", "assistant"] = "assistant"
@@ -74,6 +114,15 @@ class MsgNode:
     parent_msg: Optional[discord.Message] = None
 
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+async def _prune_message_cache() -> None:
+    # Delete oldest MsgNodes (lowest message IDs) from the cache
+    if (num_nodes := len(msg_nodes)) <= MAX_MESSAGE_NODES:
+        return
+    for msg_id in sorted(msg_nodes.keys())[: num_nodes - MAX_MESSAGE_NODES]:
+        async with msg_nodes.setdefault(msg_id, MsgNode()).lock:
+            msg_nodes.pop(msg_id, None)
 
 
 @discord_bot.tree.command(name="model", description="View or switch the current model")
@@ -169,31 +218,60 @@ async def on_message(new_msg: discord.Message) -> None:
     max_text = config.get("max_text", 100000)
     max_images = config.get("max_images", 5) if accept_images else 0
     max_messages = config.get("max_messages", 25)
+    stt_config = config.get("stt") or {}
+    stt_max_bytes = int(stt_config.get("max_bytes") or DEFAULT_MAX_BYTES)
+    stt_max_clips = int(stt_config.get("max_clips") or DEFAULT_MAX_CLIPS)
+    transcriber = speech_from_config(config, httpx_client)
 
     # Build message chain and set user warnings
     messages = []
     user_warnings = set()
+    triggering_voice = VoiceNoteResult()
     curr_msg = new_msg
 
     while curr_msg != None and len(messages) < max_messages:
         curr_node = msg_nodes.setdefault(curr_msg.id, MsgNode())
 
         async with curr_node.lock:
+            voice = VoiceNoteResult()
             if curr_node.text == None:
                 cleaned_content = curr_msg.content.removeprefix(discord_bot.user.mention).lstrip()
 
-                good_attachments = [att for att in curr_msg.attachments if att.content_type and any(att.content_type.startswith(x) for x in ("text", "image"))]
+                good_attachments = [
+                    att
+                    for att in curr_msg.attachments
+                    if att.content_type
+                    and any(att.content_type.startswith(prefix) for prefix in ("text", "image"))
+                    and not is_audio_attachment(att.content_type, att.filename)
+                ]
 
                 attachment_responses = await asyncio.gather(*[httpx_client.get(att.url) for att in good_attachments])
 
                 curr_node.role = "assistant" if curr_msg.author == discord_bot.user else "user"
+                if curr_node.role == "user":
+                    voice = await resolve_voice_note(
+                        message_id=curr_msg.id,
+                        user_id=curr_msg.author.id,
+                        clips=_audio_clips(curr_msg),
+                        stt=transcriber,
+                        load_saved=_memory.get_transcript,
+                        store_text=_memory.save_transcript,
+                        max_bytes=stt_max_bytes,
+                        max_clips=stt_max_clips,
+                    )
 
-                curr_node.text = "\n".join(
-                    ([cleaned_content] if cleaned_content else [])
-                    + ["\n".join(filter(None, (embed.title, embed.description, embed.footer.text))) for embed in curr_msg.embeds]
-                    + [component.content for component in curr_msg.components if component.type == discord.ComponentType.text_display]
-                    + [resp.text for att, resp in zip(good_attachments, attachment_responses) if att.content_type.startswith("text")]
-                )
+                embed_bits = ["\n".join(filter(None, (embed.title, embed.description, embed.footer.text))) for embed in curr_msg.embeds]
+                component_bits = [
+                    component.content
+                    for component in curr_msg.components
+                    if component.type == discord.ComponentType.text_display and component.content
+                ]
+                if curr_node.role == "assistant":
+                    component_bits = [strip_heard_prefix(bit) for bit in component_bits]
+                file_bits = [
+                    resp.text for att, resp in zip(good_attachments, attachment_responses) if att.content_type.startswith("text")
+                ]
+                curr_node.text = merge_message_text(cleaned_content, *embed_bits, *component_bits, *file_bits, voice.transcript)
 
                 curr_node.images = [
                     dict(type="image_url", image_url=dict(url=f"data:{att.content_type};base64,{b64encode(resp.content).decode('utf-8')}"))
@@ -204,7 +282,17 @@ async def on_message(new_msg: discord.Message) -> None:
                 if curr_node.role == "user" and (curr_node.text or curr_node.images):
                     curr_node.text = f"<@{curr_msg.author.id}>: {curr_node.text}"
 
-                curr_node.has_bad_attachments = len(curr_msg.attachments) > len(good_attachments)
+                audio_count = sum(1 for att in curr_msg.attachments if is_audio_attachment(att.content_type, att.filename))
+                curr_node.has_bad_attachments = len(curr_msg.attachments) > len(good_attachments) + audio_count
+                other_text = bool(cleaned_content.strip() or any(bit.strip() for bit in embed_bits) or any(bit.strip() for bit in file_bits))
+                if should_retry_voice(
+                    had_audio=voice.had_audio,
+                    transcript=voice.transcript,
+                    retryable=voice.unconfigured or bool(voice.failed),
+                    has_other_text=other_text,
+                    has_images=bool(curr_node.images),
+                ):
+                    curr_node.text = None
 
                 try:
                     if (
@@ -229,15 +317,20 @@ async def on_message(new_msg: discord.Message) -> None:
                     logging.exception("Error fetching next message in the chain")
                     curr_node.fetch_parent_failed = True
 
+            if curr_msg.id == new_msg.id:
+                triggering_voice = voice
+                user_warnings.update(voice.warnings())
+
+            shown = curr_node.text or ""
             if curr_node.images[:max_images]:
-                content = [dict(type="text", text=curr_node.text[:max_text])] + curr_node.images[:max_images]
+                content = [dict(type="text", text=shown[:max_text])] + curr_node.images[:max_images]
             else:
-                content = curr_node.text[:max_text]
+                content = shown[:max_text]
 
             if content != "":
                 messages.append(dict(content=content, role=curr_node.role))
 
-            if len(curr_node.text) > max_text:
+            if len(shown) > max_text:
                 user_warnings.add(f"⚠️ Max {max_text:,} characters per message")
             if len(curr_node.images) > max_images:
                 user_warnings.add(f"⚠️ Max {max_images} image{'' if max_images == 1 else 's'} per message" if max_images > 0 else "⚠️ Can't see images")
@@ -248,16 +341,34 @@ async def on_message(new_msg: discord.Message) -> None:
 
             curr_msg = curr_node.parent_msg
 
-    logging.info(f"Message received (user ID: {new_msg.author.id}, attachments: {len(new_msg.attachments)}, conversation length: {len(messages)}):\n{new_msg.content}")
+    node = msg_nodes.get(new_msg.id)
+    node_text = (node.text or "") if node else ""
+    node_images = node.images if node else []
+    logging.info(
+        "Message received (user ID: %s, attachments: %s, conversation length: %s, voice chars: %s):\n%s",
+        new_msg.author.id,
+        len(new_msg.attachments),
+        len(messages),
+        len(triggering_voice.transcript),
+        node_text or new_msg.content,
+    )
 
     memory_block = ""
     try:
-        user_text = new_msg.content.removeprefix(discord_bot.user.mention).lstrip()
-        for fact in extract_facts(user_text):
+        for fact in extract_facts(node_text):
             _memory.remember(new_msg.author.id, fact)
         memory_block = format_memory_block(_memory.recall(new_msg.author.id))
     except Exception:
         logging.exception("Error updating user memory")
+
+    if not should_answer_with_model(text=node_text, image_count=len(node_images), had_audio=triggering_voice.had_audio):
+        try:
+            notice = discord.Embed(description=triggering_voice.fallback_reply(), color=EMBED_COLOR_COMPLETE)
+            await new_msg.reply(embed=notice, silent=True)
+        except Exception:
+            logging.exception("Error sending voice-note notice")
+        await _prune_message_cache()
+        return
 
     if system_prompt := config.get("system_prompt"):
         now = datetime.now().astimezone()
@@ -279,7 +390,10 @@ async def on_message(new_msg: discord.Message) -> None:
         max_message_length = 4000
     else:
         max_message_length = 4096 - len(STREAMING_INDICATOR)
-        embed = discord.Embed.from_dict(dict(fields=[dict(name=warning, value="", inline=False) for warning in sorted(user_warnings)]))
+        fields = [dict(name=warning, value="", inline=False) for warning in sorted(user_warnings)]
+        if triggering_voice.transcript:
+            fields.append(heard_field(triggering_voice.transcript))
+        embed = discord.Embed.from_dict(dict(fields=fields))
 
     async def reply_helper(**reply_kwargs) -> None:
         reply_target = new_msg if not response_msgs else response_msgs[-1]
@@ -334,7 +448,10 @@ async def on_message(new_msg: discord.Message) -> None:
                         last_task_time = datetime.now().timestamp()
 
             if use_plain_responses:
-                for content in response_contents:
+                visible = list(response_contents)
+                if triggering_voice.transcript and visible:
+                    visible[0] = format_heard_prefix(triggering_voice.transcript) + visible[0]
+                for content in visible:
                     await reply_helper(view=LayoutView().add_item(TextDisplay(content=content)))
 
     except Exception:
@@ -344,11 +461,7 @@ async def on_message(new_msg: discord.Message) -> None:
         msg_nodes[response_msg.id].text = "".join(response_contents)
         msg_nodes[response_msg.id].lock.release()
 
-    # Delete oldest MsgNodes (lowest message IDs) from the cache
-    if (num_nodes := len(msg_nodes)) > MAX_MESSAGE_NODES:
-        for msg_id in sorted(msg_nodes.keys())[: num_nodes - MAX_MESSAGE_NODES]:
-            async with msg_nodes.setdefault(msg_id, MsgNode()).lock:
-                msg_nodes.pop(msg_id, None)
+    await _prune_message_cache()
 
 
 async def main() -> None:

@@ -79,6 +79,19 @@ class MemoryStore:
                 "CREATE UNIQUE INDEX IF NOT EXISTS facts_user_key "
                 "ON facts(user_id, fact_key)"
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS transcripts (
+                    message_id INTEGER PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    text TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS transcripts_user ON transcripts(user_id)"
+            )
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path)
@@ -105,9 +118,34 @@ class MemoryStore:
             ).fetchall()
         return [row[0] for row in rows]
 
+    def save_transcript(self, message_id: int, user_id: int, text: str) -> None:
+        text = (text or "").strip()
+        if not text:
+            return
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO transcripts (message_id, user_id, text)
+                VALUES (?, ?, ?)
+                ON CONFLICT(message_id) DO UPDATE SET
+                    user_id = excluded.user_id,
+                    text = excluded.text
+                """,
+                (message_id, user_id, text[:20000]),
+            )
+
+    def get_transcript(self, message_id: int) -> str | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT text FROM transcripts WHERE message_id = ?",
+                (message_id,),
+            ).fetchone()
+        return row[0] if row else None
+
     def forget_user(self, user_id: int) -> int:
         with self._connect() as conn:
             cur = conn.execute("DELETE FROM facts WHERE user_id = ?", (user_id,))
+            conn.execute("DELETE FROM transcripts WHERE user_id = ?", (user_id,))
             return cur.rowcount
 
 
@@ -119,7 +157,7 @@ def main(argv: list[str] | None = None) -> int:
         help="sqlite path (or WISE_MENTOR_MEMORY)",
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
-    forget = sub.add_parser("forget", help="delete all facts for a Discord user id")
+    forget = sub.add_parser("forget", help="delete facts and voice transcripts for a Discord user id")
     forget.add_argument("user_id", type=int)
     rec = sub.add_parser("recall", help="print stored facts for a Discord user id")
     rec.add_argument("user_id", type=int)

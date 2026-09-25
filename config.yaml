@@ -12,6 +12,16 @@ max_messages: 25
 use_plain_responses: false
 allow_dms: true
 
+# Voice notes. Audio is transcribed and discarded; only the text is kept.
+# base_url is an OpenAI-compatible server origin (speaches), with no path.
+# Leave STT_BASE_URL unset to ignore voice notes.
+stt:
+  base_url_env: STT_BASE_URL
+  api_key_env: STT_API_KEY
+  model: Systran/faster-distil-whisper-large-v3
+  max_bytes: 10000000
+  max_clips: 3
+
 permissions:
   users:
     admin_ids:

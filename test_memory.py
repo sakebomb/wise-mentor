@@ -49,10 +49,23 @@ class StoreTests(unittest.TestCase):
     def test_forget_user_deletes_only_that_user(self):
         self.store.remember(1, "I like rockets")
         self.store.remember(2, "I play lacrosse")
+        self.store.save_transcript(10, 1, "I like rockets")
+        self.store.save_transcript(11, 2, "I play lacrosse")
         deleted = self.store.forget_user(1)
         self.assertEqual(deleted, 1)
         self.assertEqual(self.store.recall(1), [])
         self.assertEqual(self.store.recall(2), ["I play lacrosse"])
+        self.assertIsNone(self.store.get_transcript(10))
+        self.assertEqual(self.store.get_transcript(11), "I play lacrosse")
+
+    def test_transcript_round_trip_is_text_keyed_by_message(self):
+        self.assertIsNone(self.store.get_transcript(5))
+        self.store.save_transcript(5, 1, "  I like rockets  ")
+        self.assertEqual(self.store.get_transcript(5), "I like rockets")
+        self.store.save_transcript(5, 1, "I play lacrosse")
+        self.assertEqual(self.store.get_transcript(5), "I play lacrosse")
+        self.store.save_transcript(6, 1, "   ")
+        self.assertIsNone(self.store.get_transcript(6))
 
     def test_recall_caps_at_twenty_newest(self):
         for i in range(25):
