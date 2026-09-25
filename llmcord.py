@@ -1,5 +1,6 @@
 import asyncio
 from base64 import b64encode
+from io import BytesIO
 from dataclasses import dataclass, field
 from datetime import datetime
 import logging
@@ -23,13 +24,18 @@ from speech import (
     VoiceNoteResult,
     format_heard_prefix,
     from_config as speech_from_config,
+    audio_filename,
     heard_field,
     is_audio_attachment,
     merge_message_text,
+    message_has_voice_note,
     resolve_voice_note,
     should_answer_with_model,
+    should_respond,
     should_retry_voice,
+    spoken_reply_audio,
     strip_heard_prefix,
+    tts_from_config,
 )
 
 load_dotenv()
@@ -168,8 +174,13 @@ async def on_message(new_msg: discord.Message) -> None:
     global last_task_time
 
     is_dm = new_msg.channel.type == discord.ChannelType.private
-
-    if (not is_dm and discord_bot.user not in new_msg.mentions) or new_msg.author.bot:
+    voice_flag = bool(getattr(getattr(new_msg, "flags", None), "voice", False))
+    if not should_respond(
+        is_dm=is_dm,
+        mentioned=discord_bot.user in new_msg.mentions,
+        is_bot=new_msg.author.bot,
+        has_voice_note=message_has_voice_note(new_msg.attachments, voice_flag=voice_flag),
+    ):
         return
 
     role_ids = set(role.id for role in getattr(new_msg.author, "roles", ()))
@@ -222,6 +233,7 @@ async def on_message(new_msg: discord.Message) -> None:
     stt_max_bytes = int(stt_config.get("max_bytes") or DEFAULT_MAX_BYTES)
     stt_max_clips = int(stt_config.get("max_clips") or DEFAULT_MAX_CLIPS)
     transcriber = speech_from_config(config, httpx_client)
+    speaker = tts_from_config(config, httpx_client)
 
     # Build message chain and set user warnings
     messages = []
@@ -456,6 +468,18 @@ async def on_message(new_msg: discord.Message) -> None:
 
     except Exception:
         logging.exception("Error while generating response")
+
+    reply_audio = await spoken_reply_audio(
+        answer="".join(response_contents),
+        transcript=triggering_voice.transcript,
+        speaker=speaker,
+    )
+    if reply_audio and response_msgs:
+        try:
+            spoken = discord.File(BytesIO(reply_audio), filename=audio_filename(reply_audio))
+            await response_msgs[0].edit(attachments=[spoken])
+        except Exception:
+            logging.exception("Error attaching spoken reply")
 
     for response_msg in response_msgs:
         msg_nodes[response_msg.id].text = "".join(response_contents)

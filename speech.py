@@ -72,13 +72,42 @@ class VoiceNoteResult:
         return "I couldn't make that out. Try again, or type it."
 
 
+def _media_type(content_type: str | None) -> str:
+    return (content_type or "").split(";", 1)[0].strip().lower()
+
+
 def is_audio_attachment(content_type: str | None, filename: str | None = None) -> bool:
-    if content_type:
-        media = content_type.split(";", 1)[0].strip().lower()
-        if media.startswith("audio/"):
-            return True
+    if _media_type(content_type).startswith("audio/"):
+        return True
     suffix = Path(filename or "").suffix.lower()
     return suffix in AUDIO_EXTENSIONS
+
+
+def is_voice_note(content_type: str | None, filename: str | None = None) -> bool:
+    """Discord hold-to-talk clips. A song upload is audio, not a voice note."""
+    name = Path(filename or "").name.lower()
+    if name.startswith("voice-message."):
+        return True
+    return _media_type(content_type) in {"audio/ogg", "audio/opus"}
+
+
+def message_has_voice_note(attachments, voice_flag: bool = False) -> bool:
+    if voice_flag:
+        return True
+    for attachment in attachments:
+        content_type = getattr(attachment, "content_type", None)
+        filename = getattr(attachment, "filename", None)
+        if is_voice_note(content_type, filename):
+            return True
+    return False
+
+
+def should_respond(*, is_dm: bool, mentioned: bool, is_bot: bool, has_voice_note: bool) -> bool:
+    if is_bot:
+        return False
+    if is_dm:
+        return True
+    return mentioned or has_voice_note
 
 
 def merge_message_text(*parts: str) -> str:
@@ -115,11 +144,32 @@ def should_retry_voice(*, had_audio: bool, transcript: str, retryable: bool, has
     return had_audio and not transcript.strip() and retryable and not has_other_text and not has_images
 
 
-def _transcriptions_url(base_url: str) -> str:
+def _openai_audio_url(base_url: str, leaf: str) -> str:
     root = base_url.rstrip("/")
     if root.endswith("/v1"):
-        return f"{root}/audio/transcriptions"
-    return f"{root}/v1/audio/transcriptions"
+        return f"{root}/audio/{leaf}"
+    return f"{root}/v1/audio/{leaf}"
+
+
+def _transcriptions_url(base_url: str) -> str:
+    return _openai_audio_url(base_url, "transcriptions")
+
+
+def audio_filename(audio: bytes) -> str:
+    if audio.startswith(b"RIFF"):
+        return "wise-mentor.wav"
+    if audio.startswith(b"OggS"):
+        return "wise-mentor.ogg"
+    return "wise-mentor.mp3"
+
+
+def speakable_text(answer: str, limit: int) -> str:
+    cleaned = answer.replace("*", "").replace("`", "").replace("_", "")
+    collapsed = " ".join(cleaned.split())
+    if len(collapsed) <= limit:
+        return collapsed
+    cut = collapsed[:limit].rsplit(" ", 1)[0]
+    return cut or collapsed[:limit]
 
 
 class SpeechToText:
@@ -165,6 +215,66 @@ class SpeechToText:
         return str(body.get("text") or "").strip()
 
 
+DEFAULT_TTS_MAX_CHARS = 1200
+DEFAULT_TTS_MAX_AUDIO_BYTES = 8_000_000
+
+
+class TextToSpeech:
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        model: str,
+        voice: str,
+        client: httpx.AsyncClient,
+        api_key: str | None = None,
+        max_chars: int = DEFAULT_TTS_MAX_CHARS,
+        max_audio_bytes: int = DEFAULT_TTS_MAX_AUDIO_BYTES,
+        timeout: float = 60.0,
+    ) -> None:
+        if not base_url or not model or not voice:
+            raise ValueError("text-to-speech needs a base_url, model, and voice")
+        self._url = _openai_audio_url(base_url, "speech")
+        self._model = model
+        self._voice = voice
+        self._api_key = api_key or None
+        self._client = client
+        self.max_chars = max_chars
+        self.max_audio_bytes = max_audio_bytes
+        self._timeout = timeout
+
+    async def speak(self, text: str) -> bytes:
+        spoken = speakable_text(text, self.max_chars)
+        if not spoken:
+            return b""
+        headers = {"Accept": "audio/mpeg"}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        response = await self._client.post(
+            self._url,
+            headers=headers,
+            json={"model": self._model, "input": spoken, "voice": self._voice, "response_format": "mp3"},
+            timeout=self._timeout,
+        )
+        response.raise_for_status()
+        return response.content
+
+
+async def spoken_reply_audio(*, answer: str, transcript: str, speaker: TextToSpeech | None) -> bytes:
+    """Audio for a voice-note turn. Typed chats stay text. Bytes are not stored."""
+    if speaker is None or not transcript.strip() or not answer.strip():
+        return b""
+    try:
+        audio = await speaker.speak(answer)
+    except Exception as exc:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        log.warning("spoken reply failed: %s status=%s", type(exc).__name__, status)
+        return b""
+    if not audio or len(audio) > speaker.max_audio_bytes:
+        return b""
+    return audio
+
+
 def from_config(config: dict[str, Any], client: httpx.AsyncClient) -> SpeechToText | None:
     stt = config.get("stt") or {}
     base_url = stt.get("base_url")
@@ -177,6 +287,24 @@ def from_config(config: dict[str, Any], client: httpx.AsyncClient) -> SpeechToTe
         api_key=stt.get("api_key") or None,
         client=client,
         max_bytes=int(stt.get("max_bytes") or DEFAULT_MAX_BYTES),
+    )
+
+
+def tts_from_config(config: dict[str, Any], client: httpx.AsyncClient) -> TextToSpeech | None:
+    tts = config.get("tts") or {}
+    base_url = tts.get("base_url")
+    model = tts.get("model")
+    voice = tts.get("voice")
+    if not base_url or not model or not voice:
+        return None
+    return TextToSpeech(
+        base_url=str(base_url),
+        model=str(model),
+        voice=str(voice),
+        api_key=tts.get("api_key") or None,
+        client=client,
+        max_chars=int(tts.get("max_chars") or DEFAULT_TTS_MAX_CHARS),
+        max_audio_bytes=int(tts.get("max_audio_bytes") or DEFAULT_TTS_MAX_AUDIO_BYTES),
     )
 
 

@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,12 +14,20 @@ from speech import (
     format_heard_prefix,
     from_config,
     heard_field,
+    TextToSpeech,
+    audio_filename,
     is_audio_attachment,
+    is_voice_note,
     merge_message_text,
+    message_has_voice_note,
     resolve_voice_note,
     should_answer_with_model,
+    should_respond,
     should_retry_voice,
+    speakable_text,
+    spoken_reply_audio,
     strip_heard_prefix,
+    tts_from_config,
 )
 
 
@@ -298,6 +307,107 @@ class ResolveVoiceNoteTests(unittest.IsolatedAsyncioTestCase):
         await client.aclose()
 
 
+class WakeTests(unittest.TestCase):
+    def test_discord_voice_message_wakes_without_a_mention(self):
+        self.assertTrue(is_voice_note("audio/ogg; codecs=opus", "voice-message.ogg"))
+        self.assertTrue(is_voice_note(None, "voice-message.ogg"))
+        self.assertFalse(is_voice_note("audio/mpeg", "song.mp3"))
+        note = _Att("audio/ogg", "voice-message.ogg")
+        song = _Att("audio/mpeg", "song.mp3")
+        self.assertTrue(message_has_voice_note([note]))
+        self.assertFalse(message_has_voice_note([song]))
+        self.assertTrue(message_has_voice_note([], voice_flag=True))
+
+    def test_server_voice_note_is_addressed_to_the_bot(self):
+        self.assertTrue(should_respond(is_dm=False, mentioned=False, is_bot=False, has_voice_note=True))
+        self.assertTrue(should_respond(is_dm=False, mentioned=True, is_bot=False, has_voice_note=False))
+        self.assertFalse(should_respond(is_dm=False, mentioned=False, is_bot=False, has_voice_note=False))
+
+    def test_dms_still_answer_and_bots_never_do(self):
+        self.assertTrue(should_respond(is_dm=True, mentioned=False, is_bot=False, has_voice_note=False))
+        self.assertFalse(should_respond(is_dm=True, mentioned=True, is_bot=True, has_voice_note=True))
+
+
+class SpeakTests(unittest.IsolatedAsyncioTestCase):
+    async def test_posts_voice_and_strips_markup(self):
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["path"] = request.url.path
+            seen["body"] = request.read()
+            seen["accept"] = request.headers.get("accept")
+            seen["auth"] = request.headers.get("authorization")
+            return httpx.Response(200, content=b"RIFF-fake-wav")
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        speaker = TextToSpeech(
+            base_url="http://tts.example/v1",
+            model="tts-1",
+            voice="af_heart",
+            api_key="secret-token",
+            client=client,
+            max_chars=80,
+        )
+        audio = await speaker.speak("**Rockets** are worth the trouble. " + ("word " * 40))
+        self.assertEqual(audio, b"RIFF-fake-wav")
+        self.assertEqual(seen["path"], "/v1/audio/speech")
+        self.assertEqual(seen["accept"], "audio/mpeg")
+        self.assertEqual(seen["auth"], "Bearer secret-token")
+        self.assertIn(b'"voice":"af_heart"', seen["body"])
+        self.assertIn(b'"response_format":"mp3"', seen["body"])
+        self.assertEqual(audio_filename(b"ID3\x04rest"), "wise-mentor.mp3")
+        self.assertEqual(audio_filename(b"RIFF...."), "wise-mentor.wav")
+        self.assertEqual(audio_filename(b"OggSrest"), "wise-mentor.ogg")
+        self.assertIn(b"Rockets are worth the trouble.", seen["body"])
+        self.assertNotIn(b"**", seen["body"])
+        self.assertLessEqual(len(json.loads(seen["body"])["input"]), 80)
+        await client.aclose()
+
+    async def test_typed_chat_and_failures_stay_silent(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise AssertionError("typed chat was spoken")
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        speaker = TextToSpeech(base_url="http://tts.example", model="tts-1", voice="af_heart", client=client)
+        silent = await spoken_reply_audio(answer="Hello", transcript="", speaker=speaker)
+        self.assertEqual(silent, b"")
+
+        def fail(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(503, text="nope")
+
+        failing = httpx.AsyncClient(transport=httpx.MockTransport(fail))
+        broken = TextToSpeech(base_url="http://tts.example", model="tts-1", voice="af_heart", client=failing)
+        missed = await spoken_reply_audio(answer="Hello", transcript="I like rockets", speaker=broken)
+        self.assertEqual(missed, b"")
+        broken.max_audio_bytes = 3
+
+        def huge(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=b"RIFF-too-big")
+
+        big = TextToSpeech(
+            base_url="http://tts.example",
+            model="tts-1",
+            voice="af_heart",
+            client=httpx.AsyncClient(transport=httpx.MockTransport(huge)),
+            max_audio_bytes=4,
+        )
+        self.assertEqual(await spoken_reply_audio(answer="Hello", transcript="hey", speaker=big), b"")
+        await client.aclose()
+        await failing.aclose()
+
+    def test_tts_config_requires_url_model_and_voice(self):
+        client = httpx.AsyncClient()
+        self.assertIsNone(tts_from_config({}, client))
+        self.assertIsNone(tts_from_config({"tts": {"base_url": "http://tts.example", "model": "tts-1"}}, client))
+        speaker = tts_from_config(
+            {"tts": {"base_url": "http://tts.example/", "model": "tts-1", "voice": "af_heart", "max_chars": 40}},
+            client,
+        )
+        self.assertIsInstance(speaker, TextToSpeech)
+        self.assertEqual(speaker.max_chars, 40)
+        self.assertEqual(speakable_text("**Hi** there", 80), "Hi there")
+
+
 class AnswerGateTests(unittest.TestCase):
     def test_typed_text_and_images_still_answer_without_audio(self):
         self.assertTrue(should_answer_with_model(text="hello", image_count=0, had_audio=False))
@@ -350,6 +460,12 @@ class RetryTests(unittest.TestCase):
                 has_images=False,
             )
         )
+
+
+class _Att:
+    def __init__(self, content_type, filename):
+        self.content_type = content_type
+        self.filename = filename
 
 
 def _ready(payload: bytes):
