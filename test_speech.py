@@ -11,9 +11,11 @@ from speech import (
     PendingClip,
     SpeechToText,
     VoiceNoteResult,
+    answer_beside_audio,
     format_heard_prefix,
     from_config,
     heard_field,
+    split_discord_content,
     TextToSpeech,
     audio_filename,
     is_audio_attachment,
@@ -79,6 +81,28 @@ class TranscriptTextTests(unittest.TestCase):
         visible = prefix + "Rockets are worth the trouble."
         self.assertEqual(strip_heard_prefix(visible), "Rockets are worth the trouble.")
         self.assertEqual(strip_heard_prefix("No prefix here"), "No prefix here")
+
+    def test_spoken_reply_puts_the_answer_in_the_body_and_not_the_embed(self):
+        answer = "Rockets are worth the trouble."
+        self.assertTrue(answer_beside_audio(transcript="I like rockets", speak=True))
+        self.assertFalse(answer_beside_audio(transcript="I like rockets", speak=False))
+        self.assertFalse(answer_beside_audio(transcript="   ", speak=True))
+        self.assertFalse(answer_beside_audio(transcript="I like rockets", speak=True, plain=True))
+        self.assertEqual(split_discord_content(answer), [answer])
+        field = heard_field("I like rockets")
+        self.assertEqual(field["value"], "I like rockets")
+        self.assertNotIn(answer, field["value"])
+
+    def test_long_answer_splits_across_bodies_without_dropping_text(self):
+        answer = ("rockets " * 400).strip()
+        parts = split_discord_content(answer, limit=50)
+        self.assertGreater(len(parts), 1)
+        self.assertTrue(all(len(part) <= 50 for part in parts))
+        self.assertEqual("".join(parts), answer)
+        packed = split_discord_content("x" * 120, limit=50)
+        self.assertEqual("".join(packed), "x" * 120)
+        self.assertTrue(all(len(part) <= 50 for part in packed))
+        self.assertNotIn(answer, heard_field("I like rockets")["value"])
 
 
 class TranscribeTests(unittest.IsolatedAsyncioTestCase):

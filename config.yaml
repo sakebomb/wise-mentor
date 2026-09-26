@@ -23,7 +23,8 @@ stt:
   max_clips: 3
 
 # Spoken reply when he sends a voice note. Typed messages stay text.
-# The words remain in the Discord message. This audio is not stored.
+# The answer is the message body beside the audio. Heard and warnings stay in the embed.
+# This audio is not stored.
 # Leave TTS_BASE_URL unset to answer voice notes in text only.
 tts:
   base_url_env: TTS_BASE_URL

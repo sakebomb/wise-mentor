@@ -20,10 +20,12 @@ from memory import MemoryStore, extract_facts, format_memory_block
 from speech import (
     DEFAULT_MAX_BYTES,
     DEFAULT_MAX_CLIPS,
+    DISCORD_CONTENT_LIMIT,
     PendingClip,
     VoiceNoteResult,
     format_heard_prefix,
     from_config as speech_from_config,
+    answer_beside_audio,
     audio_filename,
     heard_field,
     is_audio_attachment,
@@ -33,6 +35,7 @@ from speech import (
     should_answer_with_model,
     should_respond,
     should_retry_voice,
+    split_discord_content,
     spoken_reply_audio,
     strip_heard_prefix,
     tts_from_config,
@@ -398,10 +401,16 @@ async def on_message(new_msg: discord.Message) -> None:
 
     openai_kwargs = dict(model=model, messages=messages[::-1], stream=True, extra_headers=extra_headers, extra_query=extra_query, extra_body=extra_body)
 
+    answer_in_body = False
     if use_plain_responses := config.get("use_plain_responses", False):
         max_message_length = 4000
     else:
-        max_message_length = 4096 - len(STREAMING_INDICATOR)
+        answer_in_body = answer_beside_audio(
+            transcript=triggering_voice.transcript,
+            speak=speaker is not None,
+        )
+        body_limit = DISCORD_CONTENT_LIMIT if answer_in_body else 4096
+        max_message_length = body_limit - len(STREAMING_INDICATOR)
         fields = [dict(name=warning, value="", inline=False) for warning in sorted(user_warnings)]
         if triggering_voice.transcript:
             fields.append(heard_field(triggering_voice.transcript))
@@ -434,30 +443,47 @@ async def on_message(new_msg: discord.Message) -> None:
                 if response_contents == [] and new_content == "":
                     continue
 
-                if start_next_msg := response_contents == [] or len(response_contents[-1] + new_content) > max_message_length:
-                    response_contents.append("")
+                pieces = split_discord_content(new_content, max_message_length) if answer_in_body else [new_content]
+                if not pieces:
+                    pieces = [new_content]
 
-                response_contents[-1] += new_content
+                for piece_index, piece in enumerate(pieces):
+                    more_pieces = piece_index < len(pieces) - 1
+                    if start_next_msg := response_contents == [] or len(response_contents[-1] + piece) > max_message_length:
+                        response_contents.append("")
 
-                if not use_plain_responses:
-                    time_delta = datetime.now().timestamp() - last_task_time
+                    response_contents[-1] += piece
 
-                    ready_to_edit = time_delta >= EDIT_DELAY_SECONDS
-                    msg_split_incoming = finish_reason == None and len(response_contents[-1] + curr_content) > max_message_length
-                    is_final_edit = finish_reason != None or msg_split_incoming
-                    is_good_finish = finish_reason != None and finish_reason.lower() in ("stop", "end_turn")
+                    if not use_plain_responses:
+                        time_delta = datetime.now().timestamp() - last_task_time
 
-                    if start_next_msg or ready_to_edit or is_final_edit:
-                        embed.description = response_contents[-1] if is_final_edit else (response_contents[-1] + STREAMING_INDICATOR)
-                        embed.color = EMBED_COLOR_COMPLETE if msg_split_incoming or is_good_finish else EMBED_COLOR_INCOMPLETE
+                        ready_to_edit = time_delta >= EDIT_DELAY_SECONDS
+                        msg_split_incoming = finish_reason == None and len(response_contents[-1] + curr_content) > max_message_length
+                        is_final_edit = finish_reason != None or msg_split_incoming or more_pieces
+                        is_good_finish = finish_reason != None and finish_reason.lower() in ("stop", "end_turn")
 
-                        if start_next_msg:
-                            await reply_helper(embed=embed, silent=True)
-                        else:
-                            await asyncio.sleep(EDIT_DELAY_SECONDS - time_delta)
-                            await response_msgs[-1].edit(embed=embed)
+                        if start_next_msg or ready_to_edit or is_final_edit:
+                            visible = response_contents[-1] if is_final_edit else (response_contents[-1] + STREAMING_INDICATOR)
+                            if answer_in_body and len(visible) > DISCORD_CONTENT_LIMIT:
+                                visible = response_contents[-1][:DISCORD_CONTENT_LIMIT]
+                            embed.color = EMBED_COLOR_COMPLETE if msg_split_incoming or is_good_finish else EMBED_COLOR_INCOMPLETE
 
-                        last_task_time = datetime.now().timestamp()
+                            if answer_in_body:
+                                embed.description = None
+                                if start_next_msg:
+                                    await reply_helper(content=visible, embed=embed, silent=True)
+                                else:
+                                    await asyncio.sleep(EDIT_DELAY_SECONDS - time_delta)
+                                    await response_msgs[-1].edit(content=visible, embed=embed)
+                            else:
+                                embed.description = visible
+                                if start_next_msg:
+                                    await reply_helper(embed=embed, silent=True)
+                                else:
+                                    await asyncio.sleep(EDIT_DELAY_SECONDS - time_delta)
+                                    await response_msgs[-1].edit(embed=embed)
+
+                            last_task_time = datetime.now().timestamp()
 
             if use_plain_responses:
                 visible = list(response_contents)
@@ -477,7 +503,11 @@ async def on_message(new_msg: discord.Message) -> None:
     if reply_audio and response_msgs:
         try:
             spoken = discord.File(BytesIO(reply_audio), filename=audio_filename(reply_audio))
-            await response_msgs[0].edit(attachments=[spoken])
+            edit_kwargs: dict[str, Any] = dict(attachments=[spoken])
+            if answer_in_body:
+                embed.description = None
+                edit_kwargs["embed"] = embed
+            await response_msgs[0].edit(**edit_kwargs)
         except Exception:
             logging.exception("Error attaching spoken reply")
 

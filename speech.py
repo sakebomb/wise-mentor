@@ -19,6 +19,7 @@ log = logging.getLogger(__name__)
 AUDIO_EXTENSIONS = {".ogg", ".opus", ".mp3", ".wav", ".m4a", ".webm", ".flac"}
 DEFAULT_MAX_BYTES = 10_000_000
 DEFAULT_MAX_CLIPS = 3
+DISCORD_CONTENT_LIMIT = 2000
 _HEARD_FIELD_LIMIT = 1024
 
 
@@ -119,6 +120,38 @@ def heard_field(transcript: str, limit: int = _HEARD_FIELD_LIMIT) -> dict[str, A
     if len(value) > limit:
         value = value[: limit - 3] + "..."
     return {"name": "Heard", "value": value, "inline": False}
+
+
+def answer_beside_audio(*, transcript: str, speak: bool, plain: bool = False) -> bool:
+    """Spoken voice-note replies put the answer in the message body, next to the audio.
+
+    Heard and warnings stay in the embed. The answer is not copied there too.
+    Typed chats, plain-text mode, and turns with no speech stay as they are.
+    """
+    return bool(speak) and not plain and bool(transcript.strip())
+
+
+def split_discord_content(text: str, limit: int = DISCORD_CONTENT_LIMIT) -> list[str]:
+    """Split text so each piece fits in a Discord message body. Nothing is dropped."""
+    if limit < 1:
+        raise ValueError("limit must be positive")
+    if text == "":
+        return []
+    parts: list[str] = []
+    remaining = text
+    while remaining:
+        if len(remaining) <= limit:
+            parts.append(remaining)
+            break
+        window = remaining[:limit]
+        cut = window.rfind("\n")
+        if cut < limit // 2:
+            cut = window.rfind(" ")
+        if cut <= 0:
+            cut = limit
+        parts.append(remaining[:cut])
+        remaining = remaining[cut:]
+    return parts
 
 
 def format_heard_prefix(transcript: str) -> str:
