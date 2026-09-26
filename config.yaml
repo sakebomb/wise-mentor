@@ -33,6 +33,14 @@ tts:
   voice: af_heart
   max_chars: 1200
 
+# Pictures when he asks ("draw me a rocket", "picture of a castle").
+# OpenAI-compatible POST /v1/images/generations. The bytes are not stored.
+# Leave the key unset to answer in words only.
+images:
+  base_url: https://api.x.ai/v1
+  api_key_env: XAI_API_KEY
+  model: grok-imagine-image-2.0
+
 permissions:
   users:
     admin_ids:

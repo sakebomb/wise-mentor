@@ -16,6 +16,7 @@ import httpx
 from openai import AsyncOpenAI
 import yaml
 
+from images import IMAGE_SYSTEM_NOTE, image_filename, image_prompt_from_text, images_from_config, refuses_image
 from memory import MemoryStore, extract_facts, format_memory_block
 from speech import (
     DEFAULT_MAX_BYTES,
@@ -237,6 +238,7 @@ async def on_message(new_msg: discord.Message) -> None:
     stt_max_clips = int(stt_config.get("max_clips") or DEFAULT_MAX_CLIPS)
     transcriber = speech_from_config(config, httpx_client)
     speaker = tts_from_config(config, httpx_client)
+    painter = images_from_config(config, httpx_client)
 
     # Build message chain and set user warnings
     messages = []
@@ -391,8 +393,15 @@ async def on_message(new_msg: discord.Message) -> None:
         system_prompt = system_prompt.replace("{date}", now.strftime("%B %d %Y")).replace("{time}", now.strftime("%H:%M:%S %Z%z")).strip()
         if memory_block:
             system_prompt = f"{system_prompt}\n\n{memory_block}"
+        if painter is not None:
+            system_prompt = f"{system_prompt}\n\n{IMAGE_SYSTEM_NOTE}"
 
         messages.append(dict(role="system", content=system_prompt))
+
+    image_prompt = image_prompt_from_text(node_text) if painter is not None else None
+    picture_task = None
+    if painter is not None and image_prompt and not refuses_image(image_prompt):
+        picture_task = asyncio.create_task(painter.generate(image_prompt))
 
     # Generate and send response message(s) (can be multiple if response is long)
     curr_content = finish_reason = None
@@ -500,16 +509,39 @@ async def on_message(new_msg: discord.Message) -> None:
         transcript=triggering_voice.transcript,
         speaker=speaker,
     )
-    if reply_audio and response_msgs:
+    picture = b""
+    if picture_task is not None:
         try:
-            spoken = discord.File(BytesIO(reply_audio), filename=audio_filename(reply_audio))
-            edit_kwargs: dict[str, Any] = dict(attachments=[spoken])
-            if answer_in_body:
-                embed.description = None
+            picture = await picture_task
+        except Exception:
+            logging.exception("Error making a picture")
+            picture = b""
+
+    files = []
+    if reply_audio:
+        files.append(discord.File(BytesIO(reply_audio), filename=audio_filename(reply_audio)))
+    if picture:
+        files.append(discord.File(BytesIO(picture), filename=image_filename(picture)))
+    missed_picture = picture_task is not None and not picture and not use_plain_responses
+    if missed_picture:
+        embed.add_field(name="⚠️ Couldn't make that picture", value="\u200b", inline=False)
+    if response_msgs and (files or missed_picture):
+        try:
+            edit_kwargs: dict[str, Any] = {}
+            if files:
+                edit_kwargs["attachments"] = files
+            if answer_in_body or missed_picture:
+                if answer_in_body:
+                    embed.description = None
                 edit_kwargs["embed"] = embed
             await response_msgs[0].edit(**edit_kwargs)
         except Exception:
-            logging.exception("Error attaching spoken reply")
+            logging.exception("Error attaching reply files")
+    elif picture:
+        try:
+            await new_msg.reply(file=discord.File(BytesIO(picture), filename=image_filename(picture)), silent=True)
+        except Exception:
+            logging.exception("Error sending picture")
 
     for response_msg in response_msgs:
         msg_nodes[response_msg.id].text = "".join(response_contents)
